@@ -1,0 +1,14 @@
+{
+    "<status>": {
+        "address": "0x00"
+    },
+    "read_command": {
+        "address": "0x04"
+    },
+    "read_arg": {
+        "address": "0x08"
+    },
+    "write_result": {
+        "address": "0x0C"
+    }
+}

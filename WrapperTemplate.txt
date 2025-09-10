@@ -1,0 +1,136 @@
+package trustformer
+
+import sys.process._
+
+import chisel3._
+import chisel3.util._
+import chisel3.experimental.{IntParam, BaseModule}
+import freechips.rocketchip.amba.axi4._
+import freechips.rocketchip.prci._
+import freechips.rocketchip.subsystem.{BaseSubsystem, PBUS}
+import org.chipsalliance.cde.config.{Parameters, Field, Config}
+import freechips.rocketchip.diplomacy.AddressSet
+import org.chipsalliance.diplomacy._
+import freechips.rocketchip.regmapper.{HasRegMap, RegField}
+import freechips.rocketchip.tilelink._
+import freechips.rocketchip.util._
+import freechips.rocketchip.resources._
+import freechips.rocketchip.tilelink.MemoryOpCategories.wr
+
+// DOC include start: {{ModuleName}} params
+case class {{ModuleName}}Params(
+  address: BigInt = 0x4000,
+)
+// DOC include end: {{ModuleName}} params
+
+// DOC include start: {{ModuleName}} key
+case object {{ModuleName}}Key extends Field[Option[{{ModuleName}}Params]](None)
+// DOC include end: {{ModuleName}} key
+
+class {{ModuleName}}IO() extends Bundle {
+  val CLK = Input(Clock())
+  val RST_N = Input(Bool())
+  {{ModuleIODefsBundle}}
+}
+
+class {{ModuleName}}TopIO extends Bundle {
+  val {{moduleName}}_busy = Output(Bool())
+}
+
+trait Has{{ModuleName}}TopIO {
+  def io: {{ModuleName}}TopIO
+}
+
+// DOC include start: {{ModuleName}} blackbox
+class {{ModuleName}}() extends BlackBox(Map()) with HasBlackBoxResource {
+  val io = IO(new {{ModuleName}}IO())
+  addResource("/vsrc/{{ModuleName}}.v")
+}
+// DOC include end: {{ModuleName}} blackbox
+
+// DOC include start: {{ModuleName}} router
+class {{ModuleName}}TL(params: {{ModuleName}}Params, beatBytes: Int)(implicit p: Parameters) extends ClockSinkDomain(ClockSinkParameters())(p) {
+  val device = new SimpleDevice("{{modulename}}", Seq("ucbbar,{{modulename}}"))
+  val node = TLRegisterNode(Seq(AddressSet(params.address, 4096-1)), device, "reg/control", beatBytes=beatBytes)
+
+  override lazy val module = new {{ModuleName}}Impl
+  class {{ModuleName}}Impl extends Impl with Has{{ModuleName}}TopIO {
+    val io = IO(new {{ModuleName}}TopIO)
+    withClockAndReset(clock, reset) {
+      {{ModuleIODefsChisel}}
+
+      val impl_io = {
+        val impl = Module(new {{ModuleName}}())
+        impl.io
+      } 
+      
+      impl_io.CLK := clock
+      impl_io.RST_N := !reset.asBool
+
+      {{ModuleIOConnections}}
+      io.{{moduleName}}_busy := {{ModuleBusySignal}}
+// DOC include start: {{ModuleName}} instance regmap
+      node.regmap(
+        {{ModuleRegFields}}
+          ) 
+// DOC include end: {{ModuleName}} instance regmap
+    }
+  }
+}
+
+
+// DOC include start: {{ModuleName}} lazy trait
+trait CanHavePeriphery{{ModuleName}} { this: BaseSubsystem =>
+  private val portName = "{{modulename}}"
+
+  private val pbus = locateTLBusWrapper(PBUS)
+
+  // Only build if we are using the TL (nonAXI4) version
+  val ({{moduleName}}_busy, {{moduleName}}_clock) = p({{ModuleName}}Key) match {
+    case Some(params) => {
+
+      // Define the clock source node for the {{ModuleName}} module.
+      val {{moduleName}}ClockNode = pbus.fixedClockNode
+
+      // Define the type of clock crossing required between the pbus and the {{ModuleName}} module.
+      val {{moduleName}}Crossing = SynchronousCrossing()
+
+
+      // Instantiate the {{ModuleName}} module (either TL, AXI4, or HLS variant)
+      val {{moduleName}} = {
+        val {{moduleName}} = lazymodule.LazyModule(new {{ModuleName}}TL(params, pbus.beatBytes)(p))
+        // Connect the {{ModuleName}}'s clock input to our determined {{ModuleName}}ClockNode.
+        {{moduleName}}.clockNode := {{moduleName}}ClockNode
+        // Couple the {{ModuleName}} to the pbus, inserting the necessary clock crossing logic.
+        pbus.coupleTo(portName) {
+          // TLInwardClockCrossingHelper handles crossing details for TileLink.
+          TLInwardClockCrossingHelper("{{ModuleName}}_crossing", {{moduleName}}, {{moduleName}}.node)({{moduleName}}Crossing) :=
+          TLFragmenter(pbus.beatBytes, pbus.blockBytes) := _
+        }
+        {{moduleName}}
+      }
+      // Expose the {{ModuleName}}'s busy signal.
+      val {{moduleName}}_busy = lazymodule.InModuleBody {
+        val busy = IO(Output(Bool())).suggestName("{{moduleName}}_busy")
+        busy := {{moduleName}}.module.io.{{moduleName}}_busy
+        busy
+      }
+      // Return the busy signal (always needed if {{ModuleName}} exists) and the optional external clock input.
+      // The Option[Clock] allows the IOBinder (With{{ModuleName}}IOPunchthrough) to conditionally
+      // create the top-level clock input only when `externallyClocked` is true.
+      // The busy signal is Some(busy) because the entire {{ModuleName}} peripheral itself is optional based on {{ModuleName}}Key.
+      (Some({{moduleName}}_busy), None)
+    }
+    // If {{ModuleName}}Key is None, the {{ModuleName}} peripheral is not instantiated. Return None for both signals.
+    case None => (None, None)
+  }
+}
+// DOC include end: {{ModuleName}} lazy trait
+
+// DOC include start: {{ModuleName}} config fragment
+class With{{ModuleName}}(address: BigInt = 0x4000) extends Config((site, here, up) => {
+  case {{ModuleName}}Key => {
+    Some({{ModuleName}}Params(address))
+  }
+})
+// DOC include end: {{ModuleName}} config fragment
