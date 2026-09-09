@@ -1,0 +1,20 @@
+{
+    "<status>": {
+        "address": "0x00"
+    },
+    "in_cmd": {
+        "address": "0x04"
+    },
+    "in_param_fs_in_pin": {
+        "address": "0x08"
+    },
+    "in_param_fs_in_secret": {
+        "address": "0x0C"
+    },
+    "out_param_fs_out_status": {
+        "address": "0x10"
+    },
+    "out_param_fs_out_secret": {
+        "address": "0x14"
+    }
+}
