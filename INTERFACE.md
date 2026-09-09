@@ -53,3 +53,26 @@ examples), *not* the data width.
 * one read-only MMIO register per `out_param_<y>`, wired straight to `_arg`;
 * `busy = cmd_pending || !ready`, exposed as bit 0 of the status register and as the
   module's top-level `_busy` output.
+
+## Register widths
+
+Nothing in the spec constrains a variable's width — `tfs_spec_states_size` and its
+input/output counterparts return an arbitrary `nat`, and `tf_action_reg_size` sets
+the command width independently. The bus does constrain it: `RegMapper` requires
+`offset + field.width <= beatBytes * 8`, so a single register may not straddle a bus
+word.
+
+The generator therefore splits every value into 32-bit words at consecutive 4-byte
+offsets. 32 bits at a 4-byte-aligned offset fits a word on any bus with
+`beatBytes >= 4`, and it matches the `reg_read32` / `reg_write32` helpers on the
+software side. Word *k* carries bits `[32k+31 : 32k]`; the last word is narrower when
+the width is not a multiple of 32.
+
+* an input of width *W* becomes `ceil(W/32)` read-write holding registers, which the
+  wrapper concatenates onto `in_param_<x>_out`;
+* an output of width *W* becomes `ceil(W/32)` read-only registers, each a slice of
+  `out_param_<y>_arg`;
+* a command of width *A* becomes `ceil(A/32)` registers of which only the **last** is
+  the trigger — writing it is what launches the command, so the lower words have to
+  be written first. For the usual `A <= 32` there is a single register and this is
+  just "write the command".

@@ -44,7 +44,16 @@ SCALA_DIR = os.path.join("src", "main", "scala")
 TEMPLATE = "WrapperTemplate.txt"
 
 STATUS_KEY = "<status>"
-MAX_REG_WIDTH = 64  # one RegField must fit in a bus beat
+
+# A RegField may not span a bus word: RegMapper requires
+# `off + field.width <= beatBytes * 8` (rocket-chip RegMapper.scala L114), and the
+# word size is the bus' beatBytes, not something we control. Spec variables are
+# arbitrary-width, so every value is split into 32-bit words at consecutive
+# 4-byte offsets -- 32 bits at a 4-byte-aligned offset always fits a word for any
+# beatBytes >= 4, and it matches the reg_read32/reg_write32 helpers on the
+# software side. Word k holds bits [32k+31 : 32k]; the last word may be narrower.
+CHUNK = 32
+WINDOW_BYTES = 4096  # must match the AddressSet size in WrapperTemplate.txt
 
 
 def substitute(template, name, lines):
@@ -113,7 +122,7 @@ def classify(ports):
 
     expect("in_cmd_arg", "output", 1)
     cmd_width = expect("in_cmd_out", "input") - 1  # the extra bit is `valid`
-    if cmd_width < 1 or cmd_width > MAX_REG_WIDTH:
+    if cmd_width < 1:
         raise UnsupportedModule("unsupported command width %d" % cmd_width)
 
     inputs, outputs = [], []
@@ -135,36 +144,66 @@ def classify(ports):
         else:
             raise UnsupportedModule("unexpected port %s" % name)
 
-    for base, width in inputs + outputs:
-        if width > MAX_REG_WIDTH:
-            raise UnsupportedModule(
-                "%s is %d bits, wider than one register" % (base, width)
-            )
     return cmd_width, inputs, outputs
 
 
-def load_or_build_regmap(base_name, inputs, outputs):
-    """Read the checked-in register map, filling in any missing entry."""
+def chunk_widths(width):
+    """Split `width` into consecutive 32-bit words; the last may be narrower."""
+    n = (width + CHUNK - 1) // CHUNK
+    return [CHUNK] * (n - 1) + [width - CHUNK * (n - 1)]
+
+
+def load_or_build_regmap(base_name, slots):
+    """Read the checked-in register map, filling in and validating addresses.
+
+    `slots` is [(key, nbytes)] in allocation order; a value that needs several
+    32-bit words reserves that many consecutive 4-byte slots from its address.
+    """
     path = os.path.join(REGMAP_DIR, base_name + ".json")
     regmap = {}
     if os.path.exists(path):
         with open(path) as f:
             regmap = json.load(f)
 
-    wanted = [STATUS_KEY, "in_cmd"] + [b for b, _ in inputs] + [b for b, _ in outputs]
-    used = {
-        int(regmap[k]["address"], 0)
-        for k in regmap
-        if regmap.get(k, {}).get("address", "").strip()
-    }
-    next_addr = 0
-    for key in wanted:
-        if key in regmap and regmap[key].get("address", "").strip():
+    def pinned(key):
+        addr = regmap.get(key, {}).get("address", "").strip()
+        return int(addr, 0) if addr else None
+
+    # Reserve what the register map already pins, then fill the gaps.
+    occupied = {}
+    for key, nbytes in slots:
+        addr = pinned(key)
+        if addr is None:
             continue
-        while next_addr in used:
+        if addr % 4:
+            raise UnsupportedModule(
+                "address %s of %s is not 4-byte aligned" % (regmap[key]["address"], key)
+            )
+        for off in range(addr, addr + nbytes, 4):
+            if off in occupied:
+                raise UnsupportedModule(
+                    "%s overlaps %s at offset 0x%02X" % (key, occupied[off], off)
+                )
+            occupied[off] = key
+
+    next_addr = 0
+    for key, nbytes in slots:
+        if pinned(key) is not None:
+            continue
+        while any(
+            (next_addr + off) in occupied for off in range(0, nbytes, 4)
+        ):
             next_addr += 4
         regmap[key] = {"address": "0x%02X" % next_addr}
-        used.add(next_addr)
+        for off in range(next_addr, next_addr + nbytes, 4):
+            occupied[off] = key
+
+    end = max(occupied) + 4 if occupied else 0
+    if end > WINDOW_BYTES:
+        raise UnsupportedModule(
+            "register map needs %d bytes, more than the %d-byte window in "
+            "WrapperTemplate.txt" % (end, WINDOW_BYTES)
+        )
 
     os.makedirs(REGMAP_DIR, exist_ok=True)
     with open(path, "w") as f:
@@ -182,13 +221,26 @@ def generate(file_path):
             "file %s declares module %s; they must match so that the BlackBox "
             "resource resolves" % (os.path.basename(file_path), module_name)
         )
-    regmap = load_or_build_regmap(base_name, inputs, outputs)
+
+    cmd_chunks = chunk_widths(cmd_width)
+    in_chunks = {base: chunk_widths(width) for base, width in inputs}
+    out_chunks = {base: chunk_widths(width) for base, width in outputs}
+
+    slots = (
+        [(STATUS_KEY, 4), ("in_cmd", 4 * len(cmd_chunks))]
+        + [(b, 4 * len(in_chunks[b])) for b, _ in inputs]
+        + [(b, 4 * len(out_chunks[b])) for b, _ in outputs]
+    )
+    regmap = load_or_build_regmap(base_name, slots)
 
     bundle, chisel, conn, regs = [], [], [], []
 
     def addr(key):
         a = regmap.get(key, {}).get("address", "").strip()
-        return a or None
+        return int(a, 0) if a else None
+
+    def emit_reg(base_addr, word, line, note=""):
+        regs.append("0x%02X -> Seq(%s),%s" % (base_addr + 4 * word, line, note))
 
     # -- command channel ---------------------------------------------------
     bundle += [
@@ -196,12 +248,26 @@ def generate(file_path):
         "val in_cmd_out = Input(UInt(%d.W)) // [%d] is valid, [%d:0] the command"
         % (cmd_width + 1, cmd_width, cmd_width - 1),
     ]
+    trigger_width = cmd_chunks[-1]
     chisel += [
-        "val cmd = Wire(new DecoupledIO(UInt(%d.W)))" % cmd_width,
+        "val cmd = Wire(new DecoupledIO(UInt(%d.W)))" % trigger_width,
         "val cmd_reg = RegInit(0.U(%d.W))" % cmd_width,
         "val cmd_pending = RegInit(false.B)",
         "val busy = Wire(Bool())",
     ]
+    # Words below the last one are plain holding registers; the last one is the
+    # write that actually launches the command.
+    for word in range(len(cmd_chunks) - 1):
+        chisel.append(
+            "val cmd_low_%d = RegInit(0.U(%d.W))" % (word, cmd_chunks[word])
+        )
+    if len(cmd_chunks) == 1:
+        assemble = "cmd.bits"
+    else:
+        parts = ["cmd.bits"] + [
+            "cmd_low_%d" % w for w in reversed(range(len(cmd_chunks) - 1))
+        ]
+        assemble = "Cat(%s)" % ", ".join(parts)
     conn += [
         "// Accept one command at a time from the bus, then present it to the",
         "// module until it takes it -- and drop `valid` immediately afterwards:",
@@ -209,7 +275,7 @@ def generate(file_path):
         "// would re-execute the action every cycle.",
         "cmd.ready := !cmd_pending",
         "when (cmd.fire) {",
-        "  cmd_reg := cmd.bits",
+        "  cmd_reg := %s" % assemble,
         "  cmd_pending := true.B",
         "} .elsewhen (cmd_pending && impl_io.in_cmd_arg) {",
         "  cmd_pending := false.B",
@@ -217,51 +283,78 @@ def generate(file_path):
         "impl_io.in_cmd_out := Cat(cmd_pending, cmd_reg)",
         "busy := cmd_pending || !impl_io.in_cmd_arg",
     ]
-    if addr("in_cmd"):
-        regs.append("%s -> Seq(RegField.w(%d, cmd))," % (addr("in_cmd"), cmd_width))
+    if addr("in_cmd") is not None:
+        for word in range(len(cmd_chunks) - 1):
+            emit_reg(
+                addr("in_cmd"), word, "RegField(%d, cmd_low_%d)" % (cmd_chunks[word], word)
+            )
+        emit_reg(
+            addr("in_cmd"),
+            len(cmd_chunks) - 1,
+            "RegField.w(%d, cmd)" % trigger_width,
+            "" if len(cmd_chunks) == 1 else " // writing this word launches the command",
+        )
 
     # -- input arguments ---------------------------------------------------
     for base, width in inputs:
+        widths = in_chunks[base]
         bundle += [
             "val %s_arg = Output(Bool()) // hardwired 1'b1, unused" % base,
             "val %s_out = Input(UInt(%d.W))" % (base, width),
         ]
-        chisel.append("val %s_reg = RegInit(0.U(%d.W))" % (base, width))
+        if len(widths) == 1:
+            chisel.append("val %s_reg = RegInit(0.U(%d.W))" % (base, width))
+            value = "%s_reg" % base
+        else:
+            for word, w in enumerate(widths):
+                chisel.append("val %s_reg_%d = RegInit(0.U(%d.W))" % (base, word, w))
+            value = "Cat(%s)" % ", ".join(
+                "%s_reg_%d" % (base, w) for w in reversed(range(len(widths)))
+            )
         conn += [
             "// held, not pulsed: the module samples this in the accept cycle",
-            "impl_io.%s_out := %s_reg" % (base, base),
+            "impl_io.%s_out := %s" % (base, value),
         ]
-        if addr(base):
-            regs.append("%s -> Seq(RegField(%d, %s_reg))," % (addr(base), width, base))
+        if addr(base) is not None:
+            for word, w in enumerate(widths):
+                name = "%s_reg" % base if len(widths) == 1 else "%s_reg_%d" % (base, word)
+                emit_reg(addr(base), word, "RegField(%d, %s)" % (w, name))
 
     # -- outputs -----------------------------------------------------------
     for base, width in outputs:
+        widths = out_chunks[base]
         bundle += [
             "val %s_arg = Output(UInt(%d.W))" % (base, width),
             "val %s_out = Input(Bool()) // ack, latched into a register nothing reads"
             % base,
         ]
         conn.append("impl_io.%s_out := false.B" % base)
-        if addr(base):
-            regs.append(
-                "%s -> Seq(RegField.r(%d, impl_io.%s_arg)),"
-                % (addr(base), width, base)
-            )
+        if addr(base) is not None:
+            for word, w in enumerate(widths):
+                if len(widths) == 1:
+                    src = "impl_io.%s_arg" % base
+                else:
+                    src = "impl_io.%s_arg(%d, %d)" % (
+                        base,
+                        CHUNK * word + w - 1,
+                        CHUNK * word,
+                    )
+                emit_reg(addr(base), word, "RegField.r(%d, %s)" % (w, src))
 
     # -- status ------------------------------------------------------------
-    if addr(STATUS_KEY):
-        regs.append("%s -> Seq(RegField.r(1, busy))," % addr(STATUS_KEY))
+    if addr(STATUS_KEY) is not None:
+        emit_reg(addr(STATUS_KEY), 0, "RegField.r(1, busy)")
 
     regs = sorted(regs, key=lambda line: int(line.split(" ")[0], 0))
+    # the last entry must not carry a trailing comma into node.regmap(...)
+    regs[-1] = regs[-1].replace("),", ")", 1) if regs[-1].endswith(",") else regs[-1].replace("), //", ") //", 1)
 
     with open(TEMPLATE) as f:
         template = f.read()
-    out = (
-        substitute(template, "ModuleIODefsBundle", bundle)
-    )
+    out = substitute(template, "ModuleIODefsBundle", bundle)
     out = substitute(out, "ModuleIODefsChisel", chisel)
     out = substitute(out, "ModuleIOConnections", conn)
-    out = substitute(out, "ModuleRegFields", [l.rstrip(",") if i == len(regs) - 1 else l for i, l in enumerate(regs)])
+    out = substitute(out, "ModuleRegFields", regs)
     out = (
         out.replace("{{ModuleBusySignal}}", "busy")
         .replace("{{ModuleName}}", module_name)
@@ -274,15 +367,13 @@ def generate(file_path):
     with open(scala_path, "w") as f:
         f.write(out)
     print("  wrote %s" % scala_path)
-    print(
-        "  registers: "
-        + ", ".join(
-            "%s@%s" % (k, regmap[k]["address"])
-            for k in [STATUS_KEY, "in_cmd"]
-            + [b for b, _ in inputs]
-            + [b for b, _ in outputs]
+    for key, nbytes in slots:
+        a = regmap.get(key, {}).get("address", "").strip()
+        words = nbytes // 4
+        print(
+            "    %-28s %s%s"
+            % (key, a, "" if words == 1 else " .. 0x%02X (%d words)" % (int(a, 0) + nbytes - 4, words))
         )
-    )
 
 
 def main(argv):

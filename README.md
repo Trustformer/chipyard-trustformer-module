@@ -3,9 +3,23 @@
 Chipyard peripheral wrappers for Trustformer-generated Kôika modules.
 
 * `INTERFACE.md` — the wire protocol the generated modules speak. Read this first.
-* `GenerateWrappers.py` — reads `src/main/resources/vsrc/*.v`, writes
+* `GenerateWrappers.py` --- reads `src/main/resources/vsrc/*.v`, writes
   `src/main/scala/<Module>Wrapper.scala` from `WrapperTemplate.txt`, and writes back
   `src/main/resources/regmap/<Module>.json` with the addresses it used.
+
+## Register widths
+
+Spec variables are arbitrary-width, and a `RegField` may not straddle a bus word
+(`RegMapper` requires `offset + width <= beatBytes * 8`). Every value is therefore
+split into 32-bit words at consecutive 4-byte offsets, which fits any bus with
+`beatBytes >= 4` and lines up with the `reg_read32`/`reg_write32` helpers in
+`chipyard/tests/mmio.h`. Word *k* holds bits `[32k+31 : 32k]`; the last word is
+narrower when the width is not a multiple of 32.
+
+An address in the register-map JSON is the address of word 0, and the port reserves
+as many 4-byte slots as it needs from there. A value that spans several words is
+read or written a word at a time; for the command register, writing the *last* word
+is what launches the command, so the lower words must be written first.
 
 ## Adding a module
 
