@@ -1,0 +1,56 @@
+{
+    "<status>": {
+        "address": "0x00"
+    },
+    "in_cmd": {
+        "address": "0x04"
+    },
+    "in_param_pub_in_ctx": {
+        "address": "0x08"
+    },
+    "in_param_pub_in_ctxlen": {
+        "address": "0x28"
+    },
+    "in_param_pub_in_dig": {
+        "address": "0x2C"
+    },
+    "in_param_pub_in_idx": {
+        "address": "0x4C"
+    },
+    "in_param_pub_in_nlen": {
+        "address": "0x50"
+    },
+    "in_param_pub_in_nonce": {
+        "address": "0x54"
+    },
+    "in_param_pub_in_pt": {
+        "address": "0x74"
+    },
+    "in_param_pub_in_regsel": {
+        "address": "0x78"
+    },
+    "out_param_pub_out_cap": {
+        "address": "0x7C"
+    },
+    "out_param_pub_out_dout": {
+        "address": "0x80"
+    },
+    "out_param_pub_out_failure": {
+        "address": "0xA0"
+    },
+    "out_param_pub_out_pcr0": {
+        "address": "0xA4"
+    },
+    "out_param_pub_out_pcr1": {
+        "address": "0xC4"
+    },
+    "out_param_pub_out_rc": {
+        "address": "0xE4"
+    },
+    "out_param_pub_out_snap": {
+        "address": "0xE8"
+    },
+    "out_param_pub_out_st": {
+        "address": "0x108"
+    }
+}
