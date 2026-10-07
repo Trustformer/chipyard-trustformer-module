@@ -32,14 +32,14 @@ class Example_LockboxTriesIO() extends Bundle {
   val RST_N = Input(Bool())
   val in_cmd_arg = Output(Bool()) // the module's `ready`
   val in_cmd_out = Input(UInt(17.W)) // [16] is valid, [15:0] the command
-  val in_param_fs_in_pin_arg = Output(Bool()) // hardwired 1'b1, unused
-  val in_param_fs_in_pin_out = Input(UInt(32.W))
-  val in_param_fs_in_secret_arg = Output(Bool()) // hardwired 1'b1, unused
-  val in_param_fs_in_secret_out = Input(UInt(32.W))
-  val out_param_fs_out_secret_arg = Output(UInt(32.W))
-  val out_param_fs_out_secret_out = Input(Bool()) // ack, latched into a register nothing reads
-  val out_param_fs_out_status_arg = Output(UInt(32.W))
-  val out_param_fs_out_status_out = Input(Bool()) // ack, latched into a register nothing reads
+  val in_param_pub_fs_in_pin_arg = Output(Bool()) // hardwired 1'b1, unused
+  val in_param_pub_fs_in_pin_out = Input(UInt(32.W))
+  val in_param_pub_fs_in_secret_arg = Output(Bool()) // hardwired 1'b1, unused
+  val in_param_pub_fs_in_secret_out = Input(UInt(32.W))
+  val out_param_pub_fs_out_secret_arg = Output(UInt(32.W))
+  val out_param_pub_fs_out_secret_out = Input(Bool()) // ack, latched into a register nothing reads
+  val out_param_pub_fs_out_status_arg = Output(UInt(32.W))
+  val out_param_pub_fs_out_status_out = Input(Bool()) // ack, latched into a register nothing reads
 }
 
 class Example_LockboxTriesTopIO extends Bundle {
@@ -70,8 +70,8 @@ class Example_LockboxTriesTL(params: Example_LockboxTriesParams, beatBytes: Int)
       val cmd_reg = RegInit(0.U(16.W))
       val cmd_pending = RegInit(false.B)
       val busy = Wire(Bool())
-      val in_param_fs_in_pin_reg = RegInit(0.U(32.W))
-      val in_param_fs_in_secret_reg = RegInit(0.U(32.W))
+      val in_param_pub_fs_in_pin_reg = RegInit(0.U(32.W))
+      val in_param_pub_fs_in_secret_reg = RegInit(0.U(32.W))
 
       val impl_io = {
         val impl = Module(new Example_LockboxTries())
@@ -95,20 +95,20 @@ class Example_LockboxTriesTL(params: Example_LockboxTriesParams, beatBytes: Int)
       impl_io.in_cmd_out := Cat(cmd_pending, cmd_reg)
       busy := cmd_pending || !impl_io.in_cmd_arg
       // held, not pulsed: the module samples this in the accept cycle
-      impl_io.in_param_fs_in_pin_out := in_param_fs_in_pin_reg
+      impl_io.in_param_pub_fs_in_pin_out := in_param_pub_fs_in_pin_reg
       // held, not pulsed: the module samples this in the accept cycle
-      impl_io.in_param_fs_in_secret_out := in_param_fs_in_secret_reg
-      impl_io.out_param_fs_out_secret_out := false.B
-      impl_io.out_param_fs_out_status_out := false.B
+      impl_io.in_param_pub_fs_in_secret_out := in_param_pub_fs_in_secret_reg
+      impl_io.out_param_pub_fs_out_secret_out := false.B
+      impl_io.out_param_pub_fs_out_status_out := false.B
       io.example_LockboxTries_busy := busy
 // DOC include start: Example_LockboxTries instance regmap
       node.regmap(
         0x00 -> Seq(RegField.r(1, busy)),
         0x04 -> Seq(RegField.w(16, cmd)),
-        0x08 -> Seq(RegField(32, in_param_fs_in_pin_reg)),
-        0x0C -> Seq(RegField(32, in_param_fs_in_secret_reg)),
-        0x10 -> Seq(RegField.r(32, impl_io.out_param_fs_out_status_arg)),
-        0x14 -> Seq(RegField.r(32, impl_io.out_param_fs_out_secret_arg))
+        0x08 -> Seq(RegField(32, in_param_pub_fs_in_pin_reg)),
+        0x0C -> Seq(RegField(32, in_param_pub_fs_in_secret_reg)),
+        0x10 -> Seq(RegField.r(32, impl_io.out_param_pub_fs_out_status_arg)),
+        0x14 -> Seq(RegField.r(32, impl_io.out_param_pub_fs_out_secret_arg))
           ) 
 // DOC include end: Example_LockboxTries instance regmap
     }

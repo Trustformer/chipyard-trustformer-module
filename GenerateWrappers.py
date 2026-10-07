@@ -8,28 +8,40 @@ For every `src/main/resources/vsrc/*.v` this emits
 Port convention
 ---------------
 The module's ports are the Koika *external functions* declared in
-`coq/TypedSynthesis.v` (`Sigma` / `ext_fn_specs`).  `cuttlec` names the argument
+`coq/Backend/Lowering.v` (`Sigma` / `ext_fn_specs`).  `cuttlec` names the argument
 the module passes out `<fn>_arg` and the value handed back `<fn>_out`, which
 hides the direction of the protocol -- so classify by the function *name*, never
 by the port width (widths change with the spec; the older width heuristic broke
-the moment an action code stopped being 32 bits wide):
+the moment an action code stopped being 32 bits wide).  `<c>` is the port's
+confidentiality class, `pub` or `sec` (`coq/Contract.v`, `port_class`):
 
-    in_cmd        : bits_t 1 ~> maybe (bits_t A)
+    in_cmd           : bits_t 1 ~> maybe (bits_t A)
         in_cmd_arg  (out, 1)    the module's `ready`
         in_cmd_out  (in,  A+1)  {valid, command}; taken on `ready && valid`
-    in_param_<x>  : bits_t 1 ~> inputs_t x
-        in_param_<x>_arg (out, 1)   constant 1'b1, carries nothing
-        in_param_<x>_out (in,  W)   the argument, sampled in the accept cycle
-    out_param_<y> : outputs_t y ~> bits_t 1
-        out_param_<y>_arg (out, W)  the result
-        out_param_<y>_out (in,  1)  an ack latched into a register nothing reads
+    in_param_<c>_<x> : bits_t 1 ~> inputs_t x
+        in_param_<c>_<x>_arg (out, 1)   constant 1'b1, carries nothing
+        in_param_<c>_<x>_out (in,  W)   the argument, sampled in the accept cycle
+    out_param_<c>_<y> : outputs_t y ~> bits_t 1
+        out_param_<c>_<y>_arg (out, W)  the result
+        out_param_<c>_<y>_out (in,  1)  an ack latched into a register nothing reads
+    ip_req_sec_<p>   : bits_t (1 + R) ~> bits_t 1
+        ip_req_sec_<p>_arg (out, 1+R)   {strobe, payload}
+        ip_req_sec_<p>_out (in,  1)     an ack latched into a register nothing reads
+    ip_resp_sec_<p>  : bits_t 1 ~> inputs_t r   (r: the input carrying p's answer)
+        ip_resp_sec_<p>_arg (out, 1)    constant 1'b1, carries nothing
+        ip_resp_sec_<p>_out (in,  W)    the answer, read ip_lat cycles after the strobe
+
+Only `pub` ports are memory-mapped.  Every other port -- secret inputs and
+outputs, IP links -- goes to `<Module>Platform`, a hand-written module in
+`src/main/scala/platform/` that this script never writes; it also sees the
+public outputs, read-only.
 
 Two facts drive the generated logic:
   * arguments are latched combinationally in the cycle the command is accepted,
     so they need *holding registers* -- the MMIO sequence is "write args, then
     write the command register" (paper, 05_design/01_functional_spec.tex).
-  * `ready` is constant 1 whenever the action fits in one cycle, so a `valid`
-    held high for N cycles executes the action N times.  The wrapper drops
+  * an action that completes in its accept cycle never drops `ready`, so a
+    `valid` held high for N cycles executes it N times.  The wrapper drops
     `valid` after a single `ready && valid`, and never waits for `ready` to fall.
 """
 
@@ -41,7 +53,20 @@ import sys
 VSRC_DIR = os.path.join("src", "main", "resources", "vsrc")
 REGMAP_DIR = os.path.join("src", "main", "resources", "regmap")
 SCALA_DIR = os.path.join("src", "main", "scala")
+PLATFORM_DIR = os.path.join(SCALA_DIR, "platform")
 TEMPLATE = "WrapperTemplate.txt"
+
+# (prefix, data port, partner port, destination).  The partner is always 1 bit
+# and carries nothing; `_out` ports are module inputs, `_arg` ports outputs.
+FAMILIES = [
+    ("in_param_pub_", "_out", "_arg", "bus"),
+    ("out_param_pub_", "_arg", "_out", "bus"),
+    ("in_param_sec_", "_out", "_arg", "platform"),
+    ("out_param_sec_", "_arg", "_out", "platform"),
+    ("ip_req_sec_", "_arg", "_out", "platform"),
+    ("ip_resp_sec_", "_out", "_arg", "platform"),
+]
+DIRECTION = {"_out": "input", "_arg": "output"}
 
 STATUS_KEY = "<status>"
 
@@ -97,9 +122,11 @@ def parse_ports(path):
 
 
 def classify(ports):
-    """Split the port map into the three external-function families.
+    """Split the port map by external-function family and confidentiality class.
 
-    -> (cmd_width, [(name, width)] inputs, [(name, width)] outputs)
+    -> (cmd_width, inputs, outputs, platform): `inputs` and `outputs` are the
+    bus-mapped `pub` ports as [(base, width)]; `platform` is [(base, data, width)]
+    for every port that stays off the bus, `data` being its data-port suffix.
     """
     if "in_cmd_arg" not in ports or "in_cmd_out" not in ports:
         raise UnsupportedModule(
@@ -125,26 +152,56 @@ def classify(ports):
     if cmd_width < 1:
         raise UnsupportedModule("unsupported command width %d" % cmd_width)
 
-    inputs, outputs = [], []
-    for name in sorted(ports):
-        if name in ("CLK", "RST_N", "in_cmd_arg", "in_cmd_out"):
-            continue
-        if name.startswith("in_param_") and name.endswith("_out"):
-            base = name[: -len("_out")]
-            expect(base + "_arg", "output", 1)
-            inputs.append((base, expect(name, "input")))
-        elif name.startswith("out_param_") and name.endswith("_arg"):
-            base = name[: -len("_arg")]
-            expect(base + "_out", "input", 1)
-            outputs.append((base, expect(name, "output")))
-        elif name.startswith("in_param_") and name.endswith("_arg"):
-            continue  # checked above, alongside its _out
-        elif name.startswith("out_param_") and name.endswith("_out"):
-            continue  # checked above, alongside its _arg
-        else:
-            raise UnsupportedModule("unexpected port %s" % name)
+    inputs, outputs, platform = [], [], []
+    seen = {"CLK", "RST_N", "in_cmd_arg", "in_cmd_out"}
+    for prefix, data, partner, dest in FAMILIES:
+        for name in sorted(ports):
+            if not (name.startswith(prefix) and name.endswith(data)):
+                continue
+            base = name[: -len(data)]
+            width = expect(name, DIRECTION[data])
+            expect(base + partner, DIRECTION[partner], 1)
+            seen |= {name, base + partner}
+            if dest == "platform":
+                platform.append((base, data, width))
+            elif data == "_out":
+                inputs.append((base, width))
+            else:
+                outputs.append((base, width))
 
-    return cmd_width, inputs, outputs
+    for name in sorted(set(ports) - seen):
+        if re.match(r"(in|out)_param_(?!pub_|sec_)", name):
+            raise UnsupportedModule(
+                "port %s has no pub/sec class -- the Verilog predates the port "
+                "classes of coq/Contract.v; regenerate it" % name
+            )
+        raise UnsupportedModule("unexpected port %s" % name)
+
+    return cmd_width, inputs, outputs, platform
+
+
+def check_platform(module_name, platform):
+    """The hand-written platform module must exist when anything stays off the bus."""
+    if not platform:
+        return
+    path = os.path.join(PLATFORM_DIR, module_name + "Platform.scala")
+    cls = re.compile(r"\bclass\s+%sPlatform\b" % re.escape(module_name))
+    if os.path.exists(path):
+        with open(path) as f:
+            if cls.search(f.read()):
+                return
+    raise UnsupportedModule(
+        "%d port(s) must stay off the bus (%s); write %s declaring `class "
+        "%sPlatform(implicit p: Parameters) extends Module` with "
+        "`val io = IO(new %sPlatformIO)` to drive them"
+        % (
+            len(platform),
+            ", ".join(base for base, _, _ in platform),
+            path,
+            module_name,
+            module_name,
+        )
+    )
 
 
 def chunk_widths(width):
@@ -164,6 +221,15 @@ def load_or_build_regmap(base_name, slots):
     if os.path.exists(path):
         with open(path) as f:
             regmap = json.load(f)
+
+    # A renamed port would otherwise miss its pin and be re-addressed silently,
+    # and a pinned secret port would look mapped when it is not.
+    stale = sorted(set(regmap) - {key for key, _ in slots})
+    if stale:
+        raise UnsupportedModule(
+            "%s pins %s, which match(es) no bus-mapped port; rename or remove "
+            "the entries" % (path, ", ".join(stale))
+        )
 
     def pinned(key):
         addr = regmap.get(key, {}).get("address", "").strip()
@@ -214,13 +280,14 @@ def load_or_build_regmap(base_name, slots):
 
 def generate(file_path):
     module_name, ports = parse_ports(file_path)
-    cmd_width, inputs, outputs = classify(ports)
+    cmd_width, inputs, outputs, platform = classify(ports)
     base_name = os.path.splitext(os.path.basename(file_path))[0]
     if base_name != module_name:
         raise UnsupportedModule(
             "file %s declares module %s; they must match so that the BlackBox "
             "resource resolves" % (os.path.basename(file_path), module_name)
         )
+    check_platform(module_name, platform)
 
     cmd_chunks = chunk_widths(cmd_width)
     in_chunks = {base: chunk_widths(width) for base, width in inputs}
@@ -341,6 +408,51 @@ def generate(file_path):
                     )
                 emit_reg(addr(base), word, "RegField.r(%d, %s)" % (w, src))
 
+    # -- off the bus -------------------------------------------------------
+    platform_io, platform_conn = [], []
+    if platform:
+        notes = {
+            "in_param_sec_": "secret input, sampled in the accept cycle",
+            "out_param_sec_": "secret output",
+            "ip_req_sec_": "IP request: {strobe, payload}",
+            "ip_resp_sec_": "IP answer, read ip_lat cycles after the strobe",
+        }
+        platform_conn.append("val platform = Module(new %sPlatform()(p))" % module_name)
+        for base, data, width in platform:
+            note = next(n for pre, n in notes.items() if base.startswith(pre))
+            if data == "_out":
+                bundle += [
+                    "val %s_arg = Output(Bool()) // hardwired 1'b1, unused" % base,
+                    "val %s_out = Input(UInt(%d.W))" % (base, width),
+                ]
+                platform_io.append("val %s = Output(UInt(%d.W)) // %s" % (base, width, note))
+                platform_conn.append("impl_io.%s_out := platform.io.%s" % (base, base))
+            else:
+                bundle += [
+                    "val %s_arg = Output(UInt(%d.W))" % (base, width),
+                    "val %s_out = Input(Bool()) // ack, latched into a register nothing reads"
+                    % base,
+                ]
+                platform_io.append("val %s = Input(UInt(%d.W)) // %s" % (base, width, note))
+                platform_conn += [
+                    "platform.io.%s := impl_io.%s_arg" % (base, base),
+                    "impl_io.%s_out := false.B" % base,
+                ]
+        for base, width in outputs:
+            platform_io.append("val %s = Input(UInt(%d.W)) // public output, read-only" % (base, width))
+            platform_conn.append("platform.io.%s := impl_io.%s_arg" % (base, base))
+        platform_io = (
+            [
+                "",
+                "// The ports that stay off the bus, seen from %sPlatform, which drives"
+                % module_name,
+                "// the Outputs. It is hand-written: src/main/scala/platform/.",
+                "class %sPlatformIO extends Bundle {" % module_name,
+            ]
+            + ["  " + line for line in platform_io]
+            + ["}"]
+        )
+
     # -- status ------------------------------------------------------------
     if addr(STATUS_KEY) is not None:
         emit_reg(addr(STATUS_KEY), 0, "RegField.r(1, busy)")
@@ -355,6 +467,8 @@ def generate(file_path):
     out = substitute(out, "ModuleIODefsChisel", chisel)
     out = substitute(out, "ModuleIOConnections", conn)
     out = substitute(out, "ModuleRegFields", regs)
+    out = substitute(out, "PlatformIOBundle", platform_io)
+    out = substitute(out, "ModulePlatform", platform_conn)
     out = (
         out.replace("{{ModuleBusySignal}}", "busy")
         .replace("{{ModuleName}}", module_name)
@@ -374,6 +488,8 @@ def generate(file_path):
             "    %-28s %s%s"
             % (key, a, "" if words == 1 else " .. 0x%02X (%d words)" % (int(a, 0) + nbytes - 4, words))
         )
+    for base, _, width in platform:
+        print("    %-28s off the bus, %d bits" % (base, width))
 
 
 def main(argv):

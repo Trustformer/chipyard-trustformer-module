@@ -5,16 +5,16 @@
     "in_cmd": {
         "address": "0x04"
     },
-    "in_param_fs_in_pin": {
+    "in_param_pub_fs_in_pin": {
         "address": "0x08"
     },
-    "in_param_fs_in_secret": {
+    "in_param_pub_fs_in_secret": {
         "address": "0x0C"
     },
-    "out_param_fs_out_status": {
+    "out_param_pub_fs_out_status": {
         "address": "0x10"
     },
-    "out_param_fs_out_secret": {
+    "out_param_pub_fs_out_secret": {
         "address": "0x14"
     }
 }

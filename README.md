@@ -6,6 +6,8 @@ Chipyard peripheral wrappers for Trustformer-generated Kôika modules.
 * `GenerateWrappers.py` --- reads `src/main/resources/vsrc/*.v`, writes
   `src/main/scala/<Module>Wrapper.scala` from `WrapperTemplate.txt`, and writes back
   `src/main/resources/regmap/<Module>.json` with the addresses it used.
+* `src/main/scala/platform/` — hand-written per-design platform modules, for the
+  ports that may not be memory-mapped (`INTERFACE.md`, "The platform module").
 
 ## Register widths
 
@@ -27,20 +29,25 @@ is what launches the command, so the lower words must be written first.
    match the module name inside it, so that the `BlackBox` resource resolves.
 2. Optionally write `src/main/resources/regmap/<Module>.json` to pin the register
    addresses (offsets from the peripheral's base). Any key you leave out is assigned
-   the next free 4-byte slot. The keys are the external-function names plus the
-   meta-register `<status>`:
+   the next free 4-byte slot. The keys are the names of the `pub` ports plus the
+   meta-register `<status>`; a key that matches no `pub` port is an error, so a
+   renamed port cannot silently move:
    ```json
    {
-       "<status>":                { "address": "0x00" },
-       "in_cmd":                  { "address": "0x04" },
-       "in_param_fs_in_pin":      { "address": "0x08" },
-       "out_param_fs_out_status": { "address": "0x10" }
+       "<status>":                    { "address": "0x00" },
+       "in_cmd":                      { "address": "0x04" },
+       "in_param_pub_fs_in_pin":      { "address": "0x08" },
+       "out_param_pub_fs_out_status": { "address": "0x10" }
    }
    ```
-3. `python3 GenerateWrappers.py` (or pass specific `.v` paths).
-4. Mix `trustformer.CanHavePeriphery<Module>` into
+3. If the module has `sec` ports or IP links, write
+   `src/main/scala/platform/<Module>Platform.scala` to drive them. Its Verilog
+   dependencies (IP cores, adapters) go in a subdirectory of
+   `src/main/resources/vsrc/`, which the generator does not scan.
+4. `python3 GenerateWrappers.py` (or pass specific `.v` paths).
+5. Mix `trustformer.CanHavePeriphery<Module>` into
    `chipyard/generators/chipyard/src/main/scala/DigitalTop.scala`.
-5. Add a config to
+6. Add a config to
    `chipyard/generators/chipyard/src/main/scala/config/TrustformerConfigs.scala`:
    ```scala
    class TF<Module>Config extends Config(

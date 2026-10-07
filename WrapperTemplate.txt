@@ -40,6 +40,7 @@ class {{ModuleName}}TopIO extends Bundle {
 trait Has{{ModuleName}}TopIO {
   def io: {{ModuleName}}TopIO
 }
+{{PlatformIOBundle}}
 
 // DOC include start: {{ModuleName}} blackbox
 class {{ModuleName}}() extends BlackBox(Map()) with HasBlackBoxResource {
@@ -68,6 +69,7 @@ class {{ModuleName}}TL(params: {{ModuleName}}Params, beatBytes: Int)(implicit p:
       impl_io.RST_N := !reset.asBool
 
       {{ModuleIOConnections}}
+      {{ModulePlatform}}
       io.{{moduleName}}_busy := {{ModuleBusySignal}}
 // DOC include start: {{ModuleName}} instance regmap
       node.regmap(
